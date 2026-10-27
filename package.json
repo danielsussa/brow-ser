@@ -1,0 +1,21 @@
+{
+  "name": "brow-ser",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Single-tab, folder-contained browser for AI agents. Zero runtime deps, raw CDP over pipe.",
+  "bin": { "brow": "./brow" },
+  "main": "./src/index.js",
+  "types": "./src/index.d.ts",
+  "exports": {
+    ".": "./src/index.js",
+    "./mcp": "./src/mcp.js"
+  },
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "mcp": "node src/mcp.js",
+    "daemon": "node src/daemon.js"
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}
