@@ -1,14 +1,22 @@
 #!/usr/bin/env node
 // Servidor MCP (stdio, JSON-RPC 2.0 por linha). Zero deps — o SDK do MCP não
-// paga o próprio peso pra 14 tools sem prompts nem resources.
+// paga o próprio peso pra 16 tools sem prompts nem resources.
 //
 // Registrar no .mcp.json do repo que usa o browser:
 //   { "mcpServers": { "brow": { "command": "node", "args": ["<path>/src/mcp.js"] } } }
 import { createInterface } from "node:readline";
-import { Session } from "./client.js";
-import { STATE_DIR } from "./paths.js";
+import { Session, sessions, stopSession } from "./client.js";
+import { STATE_DIR, sessionName } from "./paths.js";
 
-const session = new Session();
+// Uma conexão por sessão. Cada sessão é um daemon/Chrome/perfil separado, então
+// dois agentes (ou duas tarefas) não brigam pela mesma aba.
+const conns = new Map();
+function conn(name) {
+  const key = sessionName(name);
+  let c = conns.get(key);
+  if (!c) conns.set(key, (c = new Session(key)));
+  return c;
+}
 const s = (desc, extra = {}) => ({ type: "string", description: desc, ...extra });
 const b = (desc) => ({ type: "boolean", description: desc });
 const n = (desc) => ({ type: "number", description: desc });
@@ -115,7 +123,30 @@ const TOOLS = [
     inputSchema: { type: "object", properties: {} },
     cmd: () => ["status", {}],
   },
+  {
+    name: "browser_sessions",
+    description: "Lista as sessões desta pasta (cada uma é um Chrome separado, com perfil e aba próprios) e quais estão de pé.",
+    inputSchema: { type: "object", properties: {} },
+    run: () => sessions(),
+    global: true,
+  },
+  {
+    name: "browser_close",
+    description: "Fecha o Chrome de uma sessão. O perfil (cookies, logins) fica no disco; a próxima chamada sobe de novo.",
+    inputSchema: { type: "object", properties: {} },
+    run: async (a) => {
+      const name = sessionName(a.session);
+      conns.get(name)?.close();
+      conns.delete(name);
+      return (await stopSession(name)) ? `sessão ${name} fechada` : `sessão ${name} não estava rodando`;
+    },
+  },
 ];
+
+const SESSION = s(
+  "opcional: nome da sessão (letras, números, _ . -). Cada sessão é um Chrome separado, com perfil, cookies e aba próprios — use uma por tarefa paralela. Omitido = sessão default"
+);
+for (const t of TOOLS) if (!t.global) t.inputSchema.properties.session = SESSION;
 
 const BY_NAME = new Map(TOOLS.map((t) => [t.name, t]));
 
@@ -136,8 +167,13 @@ async function callTool(id, params) {
   const args = params.arguments ?? {};
   pending++;
   try {
-    const [cmd, payload] = tool.cmd(args);
-    const result = await session.call(cmd, payload);
+    let result;
+    if (tool.run) {
+      result = await tool.run(args);
+    } else {
+      const [cmd, payload] = tool.cmd(args);
+      result = await conn(args.session).call(cmd, payload);
+    }
     if (tool.image && result?.base64) {
       return reply(id, {
         content: [
@@ -172,7 +208,7 @@ createInterface({ input: process.stdin }).on("line", async (line) => {
       return reply(id, {
         protocolVersion: params?.protocolVersion ?? "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "brow", version: "0.1.0", description: `browser de aba única contido em ${STATE_DIR}` },
+        serverInfo: { name: "brow", version: "0.1.0", description: `browser contido em ${STATE_DIR}: uma aba por sessão, sessões isoladas entre si` },
       });
     case "tools/list":
       return reply(id, { tools: TOOLS.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })) });

@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 process.env.BROW_HOME = mkdtempSync(join(tmpdir(), "brow-smoke-"));
-const { Brow } = await import("../src/index.js");
+const { Brow, sessions } = await import("../src/index.js");
 const brow = new Brow();
 
 const PAGE = `<!doctype html><meta charset=utf-8><title>smoke</title>
@@ -125,6 +125,17 @@ await check("click ocluso cai no fallback js", async () => {
   return "via js";
 });
 
+// Anti-bot (ex.: YouTube) checa se fetch/XHR/timers são nativos. O tracker vive
+// num mundo isolado: o mundo da página não pode ver nada do brow.
+await check("página intocada (sem __brow, globais nativos)", async () => {
+  await brow.nav(BASE);
+  const r = await brow.exec(
+    `[typeof window.__brow, ...[fetch, XMLHttpRequest.prototype.send, setTimeout, clearTimeout, window.open].map((f) => /\\[native code\\]/.test(Function.prototype.toString.call(f)))]`
+  );
+  assert(r[0] === "undefined", "window.__brow visível na página");
+  assert(r.slice(1).every(Boolean), `global não-nativo: ${JSON.stringify(r)}`);
+});
+
 await check("target=_blank navega na mesma aba", async () => {
   await brow.nav(BASE);
   await brow.clickLabel("nova aba");
@@ -183,6 +194,26 @@ await check("erro é limpo e não derruba o daemon", async () => {
     (e) => assert(/não encontrado/.test(e.message), e.message)
   );
   assert((await brow.title()) === "smoke");
+});
+
+await check("sessões paralelas são isoladas", async () => {
+  const other = new Brow("paralela");
+  try {
+    await Promise.all([other.nav(`${BASE}/other`), brow.exec("localStorage.setItem('quem','default')")]);
+    // Os dois Chromes de pé ao mesmo tempo, cada um na sua aba.
+    const [a, b] = await Promise.all([brow.info(), other.info()]);
+    assert(a.chromePid !== b.chromePid, "mesmo Chrome nas duas sessões");
+    assert(b.stateDir === join(process.env.BROW_HOME, "sessions", "paralela"), `stateDir=${b.stateDir}`);
+    assert((await brow.title()) === "smoke" && (await other.title()) === "outra", "uma sessão mexeu na aba da outra");
+    // Mesma origem, perfis diferentes: localStorage não vaza.
+    assert((await other.exec("localStorage.getItem('quem')")) === null, "localStorage vazou entre sessões");
+    const up = (await sessions()).filter((x) => x.running).map((x) => x.name);
+    assert(up.includes("default") && up.includes("paralela"), `rodando: ${up}`);
+  } finally {
+    await other.shutdown();
+  }
+  assert(!(await other.running()), "sessão paralela não desligou");
+  assert(await brow.running(), "derrubar a paralela derrubou a default");
 });
 
 await brow.shutdown();

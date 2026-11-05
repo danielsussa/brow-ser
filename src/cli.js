@@ -1,15 +1,15 @@
 // CLI. Saída pensada pra caber em prompt: densa, sem enfeite, sem cor.
 import { writeFileSync, readFileSync, existsSync, mkdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { call, closeShared, probe, LOG_FILE, STATE_DIR } from "./client.js";
-import { SHOTS_DIR } from "./paths.js";
+import { Session, probe, sessions, stopSession, STATE_DIR } from "./client.js";
 
 const HELP = `brow — browser de aba única, contido na pasta, pra agentes
 
 Estado (perfil, socket, downloads, screenshots): ${STATE_DIR}
 
   brow start [--headed]        Sobe o daemon + Chrome desta pasta
-  brow stop                    Fecha o Chrome e o daemon desta pasta
+  brow stop [--all]            Fecha o Chrome e o daemon (--all: todas as sessões)
+  brow sessions                Lista as sessões da pasta e quais estão de pé
   brow info                    pid, uptime, ocioso, onde mora o estado
   brow log [-n 50]             Últimas linhas do log do daemon
 
@@ -43,7 +43,11 @@ estável de role+label+ancestrais, sobrevive a re-render) impresso pelo snap.
 --no-wait pula o settled implícito depois da ação. Use quando você já tem um
 wait-label/wait-request logo em seguida.
 
-Env: BROW_HOME (onde fica o estado) · BROW_HEADED=1 · BROW_CHROME (binário)
+--session <nome> vale pra qualquer comando: cada sessão é um Chrome separado
+(perfil, cookies, aba), em .brow/sessions/<nome>/. Sem ela, sessão default.
+
+Env: BROW_HOME (onde fica o estado) · BROW_SESSION (sessão padrão)
+     BROW_HEADED=1 · BROW_CHROME (binário)
      BROW_IDLE=segundos (auto-desliga ocioso; 0 desliga; default 1800)
      BROW_WIDTH/BROW_HEIGHT · BROW_NO_SANDBOX=1 · BROW_CHROME_ARGS
 `;
@@ -107,7 +111,9 @@ function show(v) {
 }
 
 // --- comandos --------------------------------------------------------------
-async function run(cmd, pos, flags) {
+async function run(cmd, pos, flags, conn) {
+  const call = (c, p) => conn.call(c, p);
+  const { LOG_FILE, SHOTS_DIR } = conn.paths;
   const noWait = has(flags, "no-wait");
   const asJson = has(flags, "json");
 
@@ -121,9 +127,18 @@ async function run(cmd, pos, flags) {
       return show(info);
     }
     case "stop": {
-      if (!(await probe())) return show("não estava rodando");
+      if (has(flags, "all")) {
+        const up = (await sessions()).filter((x) => x.running);
+        for (const x of up) await stopSession(x.name);
+        return show(up.length ? `parado: ${up.map((x) => x.name).join(", ")}` : "nada rodando");
+      }
+      if (!(await probe(conn.name))) return show("não estava rodando");
       await call("shutdown").catch(() => {});
       return show("parado");
+    }
+    case "sessions": {
+      const all = await sessions();
+      return show(all.map((x) => `${x.running ? "up  " : "down"}  ${x.name.padEnd(16)} ${x.dir}`).join("\n"));
     }
     case "info":
       return show(await call("info"));
@@ -248,11 +263,13 @@ export async function main(argv = process.argv.slice(2)) {
     process.stdout.write(HELP);
     return;
   }
+  let conn = null;
   try {
-    await run(cmd, pos, flags);
-    closeShared();
+    conn = new Session(typeof flags.session === "string" ? flags.session : undefined);
+    await run(cmd, pos, flags, conn);
+    conn.close();
   } catch (e) {
-    closeShared();
+    conn?.close();
     die(e?.message ?? String(e));
   }
 }

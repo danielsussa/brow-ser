@@ -63,6 +63,27 @@ find ~/.config ~/.cache ~/.local /tmp -maxdepth 4 -newermt "@$T" 2>/dev/null
 O daemon se desliga sozinho depois de `BROW_IDLE` segundos ocioso (default 1800).
 `BROW_IDLE=0` desliga esse comportamento.
 
+## Sessões
+
+Cada daemon continua com **uma aba só**. Pra rodar várias coisas em paralelo na
+mesma pasta (dois agentes, duas contas, dois fluxos), use **sessões nomeadas**:
+cada uma é outro daemon, outro Chrome e outro perfil, em
+`.brow/sessions/<nome>/`, com o mesmo layout da raiz.
+
+```bash
+./brow nav app.com                      # sessão default = a própria .brow/
+./brow --session admin nav app.com/admin
+./brow --session cliente nav app.com
+./brow sessions                         # quem existe e quem está de pé
+./brow --session admin stop             # ou: ./brow stop --all
+```
+
+- Sem `--session` (nem `$BROW_SESSION`), nada muda: é a sessão default.
+- O login de uma sessão **não** aparece na outra; cada perfil é separado.
+- O nome aceita letras, números, `_ . -`, até 32 caracteres.
+- `$BROW_SESSION` define a sessão padrão do processo. Serve pra fixar cada
+  agente na sua sessão sem passar o parâmetro em toda chamada.
+
 ## Instalação
 
 Zero dependências. Precisa de Node ≥ 20 e um Chrome/Chromium no sistema
@@ -86,7 +107,8 @@ Adicione `.brow/` ao `.gitignore` do repo que usar.
 ## CLI
 
 ```
-brow start [--headed]      brow stop      brow info      brow log [-n 50]
+brow start [--headed]      brow stop [--all]      brow info      brow log [-n 50]
+brow sessions              --session <nome> em qualquer comando
 
 brow nav <url> [--no-wait]         brow url | title | status
 brow back | forward | reload
@@ -145,13 +167,18 @@ await brow.type(user.sid, "daniel");
 await brow.clickLabel("^Entrar$", { noWait: true });
 await brow.waitRequest("*/api/session", { method: "POST" });   // status HTTP cirúrgico
 await brow.waitLabel("Minha conta");
+
+// outra sessão = outro Chrome, roda em paralelo com a de cima
+const admin = new Brow("admin");
+await admin.nav("https://exemplo.com/admin");
+await admin.shutdown();
 ```
 
 Tipos em `src/index.d.ts`. `brow.call(cmd, params)` é a escotilha pro protocolo cru.
 
 ## MCP
 
-Servidor stdio, 14 tools, sem dependência. No `.mcp.json` do repo que vai usar:
+Servidor stdio, 16 tools, sem dependência. No `.mcp.json` do repo que vai usar:
 
 ```json
 {
@@ -164,7 +191,17 @@ Servidor stdio, 14 tools, sem dependência. No `.mcp.json` do repo que vai usar:
 `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_click_label`,
 `browser_type`, `browser_press`, `browser_hover`, `browser_see` (devolve a imagem
 inline), `browser_wait_label`, `browser_wait_until`, `browser_wait_request`,
-`browser_exec`, `browser_history`, `browser_status`.
+`browser_exec`, `browser_history`, `browser_status`, `browser_sessions`,
+`browser_close`.
+
+Toda tool de browser aceita um `session` opcional. O servidor mantém uma conexão
+por sessão, então um agente pode tocar `session: "a"` e `session: "b"` em
+paralelo sem uma pisar na aba da outra. `browser_close` fecha o Chrome de uma
+sessão (o perfil fica no disco). Pra dar a cada agente a sua sessão por padrão:
+
+```json
+{ "brow": { "command": "node", "args": ["…/src/mcp.js"], "env": { "BROW_SESSION": "agente-1" } } }
+```
 
 ## Como funciona
 
@@ -184,13 +221,17 @@ inline), `browser_wait_label`, `browser_wait_until`, `browser_wait_request`,
 Os primitivos que fazem a camada ser "AI-friendly" são **JS injetado**, não mágica
 de engine (`src/scripts.js`):
 
-- **`__brow`** — instala wrapper de `fetch`/XHR e um `MutationObserver` no início de
-  todo documento. É o que sustenta o contrato de "página pronta".
+- **`__brow`** — um `MutationObserver` instalado no início de todo documento, num
+  **mundo isolado** (`worldName`): o site não enxerga nada do brow e nenhum global
+  dele é tocado. A metade "rede" do contrato de página pronta (fetch/XHR em voo)
+  vem dos eventos `Network.*` no daemon. Wrapper de `fetch`/XHR/`setTimeout` no
+  mundo da página é detectável — o YouTube corta o vídeo em ~40s quando vê
+  `fetch` não-nativo.
 - **snapshot** — varre os elementos interativos visíveis, marca `data-brow-id` /
   `data-brow-sid`, devolve role/label/valor/opções + o texto visível.
-- **guard de aba única** — `window.open` e `target=_blank` viram navegação na mesma
-  aba. O que escapar (popup no onload) é fechado pelo watchdog de
-  `Target.targetCreated`, que adota a URL na aba de verdade.
+- **guard de aba única** — `target=_blank` vira navegação na mesma aba (pelo DOM,
+  do mundo isolado). `window.open` não é sobrescrito: o popup é fechado pelo
+  watchdog de `Target.targetCreated`, que adota a URL na aba de verdade.
 
 ### Input real, com queda pra JS
 
@@ -222,7 +263,7 @@ Toda espera devolve **por que** parou, nunca só "ok":
 | `quiet` | rede e DOM assentaram de verdade |
 | `dom-busy` | rede assentou, mas o DOM não para (ticker, animação). Devolveu depois da janela de tolerância em vez de travar |
 | `timeout` | estourou o teto — a página não para (site cheio de anúncio) |
-| `no-tracker` | sem `__brow` na página (`about:blank`, documento trocando) |
+| `no-tracker` | sem `__brow` no mundo isolado (`about:blank`, documento trocando) |
 
 ## O que veio do handoff, e o que mudou
 
@@ -234,7 +275,7 @@ Mudou:
 | handoff | brow |
 |---|---|
 | daemon global em `~/.me/`, socket compartilhado | daemon por pasta, tudo em `<repo>/.brow/` |
-| multi-tab com claim de sessão (`eval "$(handoff session)"`) | uma aba, sem claim, sem `--tab` |
+| multi-tab com claim de sessão (`eval "$(handoff session)"`) | uma aba por sessão; sessões são Chromes separados, sem claim, sem `--tab` |
 | Playwright + playwright-extra + stealth + sharp | CDP cru por pipe, **zero dependências** |
 | click/press por dispatch JS | input real, com queda pra JS quando o hit-test falha |
 | settled cego pra render em `setTimeout` (limitação documentada) | timer pós-request entra no contrato |
@@ -262,6 +303,7 @@ stealth anti-bot, plugins de site.
 | var | default | o quê |
 |---|---|---|
 | `BROW_HOME` | `<cwd>/.brow` | onde mora o estado (todo o resto é derivado daqui) |
+| `BROW_SESSION` | `default` | sessão usada quando nenhuma é passada |
 | `BROW_CHROME` | autodetect | binário do Chrome |
 | `BROW_HEADED` | `0` | `1` abre janela |
 | `BROW_IDLE` | `1800` | segundos até desligar sozinho (`0` = nunca) |
@@ -269,6 +311,7 @@ stealth anti-bot, plugins de site.
 | `BROW_SETTLE_TIMEOUT` | `8000` | teto do settle (ms) |
 | `BROW_QUIET_MS` | `250` | janela de silêncio exigida |
 | `BROW_DOM_GRACE_MS` | `600` | tolerância pra DOM que não para |
+| `BROW_NET_ECHO_MS` | `500` | depois do último fetch/XHR, quanto a rede ainda conta como ocupada (render que vem num timer curto) |
 | `BROW_LOAD_TIMEOUT` | `15000` | teto do DOMContentLoaded no `nav` |
 | `BROW_NO_SANDBOX` | — | `1` força `--no-sandbox` (o boot já tenta sozinho se o sandbox falhar) |
 | `BROW_CHROME_ARGS` | — | flags extras pro Chrome |
@@ -283,4 +326,5 @@ Sobe servidor e daemon próprios (`BROW_HOME` temporário, não encosta na sua
 sessão) e cobre: boot, **contenção do estado dentro da pasta**, sid estável entre
 re-renders, input real, fallback de clique ocluso, guard de aba única nos dois
 caminhos, render tardio pós-fetch, página com ticker, `wait-request`, `see`,
-persistência de sessão entre restarts, e erro limpo sem derrubar o daemon.
+persistência de sessão entre restarts, erro limpo sem derrubar o daemon, e
+sessões paralelas isoladas (Chromes e localStorage separados).

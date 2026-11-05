@@ -1,11 +1,24 @@
 // API de biblioteca. Mesma superfície do CLI, pra o agente escrever script em
 // vez de encadear shell. Conecta no daemon da pasta (sobe se preciso).
-import { Session, probe } from "./client.js";
+//
+//   new Brow()          sessão default (ou $BROW_SESSION)
+//   new Brow("login")   outro Chrome, outro perfil, em .brow/sessions/login/
+import { Session, probe, sessions, stopSession } from "./client.js";
 import { STATE_DIR, SOCKET_PATH, LOG_FILE, PROFILE_DIR, DOWNLOADS_DIR } from "./paths.js";
 
 export class Brow {
-  constructor(session = new Session()) {
-    this.session = session;
+  /** @param {Session | string} [session] instância pronta ou nome da sessão */
+  constructor(session) {
+    this.session = session instanceof Session ? session : new Session(session);
+  }
+
+  /** Nome normalizado da sessão ("default" quando omitida). */
+  get name() {
+    return this.session.name;
+  }
+  /** Caminhos da pasta de estado desta sessão. */
+  get paths() {
+    return this.session.paths;
   }
 
   /** Escotilha: qualquer comando do protocolo, cru. */
@@ -17,7 +30,7 @@ export class Brow {
     return this.call("info");
   }
   running() {
-    return probe();
+    return probe(this.name);
   }
 
   nav(url, opts = {}) {
@@ -102,28 +115,18 @@ export class Brow {
     this.session.close();
   }
   /**
-   * Mata o Chrome e o daemon desta pasta, e só volta quando o socket
+   * Mata o Chrome e o daemon desta sessão, e só volta quando o socket
    * sumiu de verdade — senão o próximo comando reconecta num daemon que
    * está morrendo e leva "conexão caiu" na cara.
    */
-  async shutdown({ timeoutMs = 10_000 } = {}) {
-    if (!(await probe())) {
-      this.session.close();
-      return;
-    }
-    await this.call("shutdown").catch(() => {});
+  async shutdown(opts) {
     this.session.close();
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      if (!(await probe())) return;
-      await new Promise((r) => setTimeout(r, 100));
-    }
-    throw new Error("daemon não desligou no tempo esperado");
+    await stopSession(this.name, opts);
   }
 }
 
-/** Instância pronta, ligada ao daemon da pasta corrente. */
+/** Instância pronta, ligada à sessão default da pasta corrente. */
 export const brow = new Brow();
 
-export { Session, probe };
+export { Session, probe, sessions, stopSession };
 export const paths = { STATE_DIR, SOCKET_PATH, LOG_FILE, PROFILE_DIR, DOWNLOADS_DIR };

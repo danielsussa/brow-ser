@@ -75,7 +75,28 @@ export interface LabelHit {
 /** ref = `id` ou `sid` do snapshot (ou o ref efêmero devolvido por find). */
 export type Ref = string;
 
+export interface SessionInfo {
+  name: string;
+  running: boolean;
+  /** Pasta de estado da sessão: `.brow/` (default) ou `.brow/sessions/<nome>/`. */
+  dir: string;
+}
+
+/** Conexão persistente com o daemon de uma sessão. */
+export declare class Session {
+  /** Omitido = `$BROW_SESSION` ou "default". */
+  constructor(name?: string);
+  readonly name: string;
+  readonly paths: Record<string, string>;
+  call(cmd: string, params?: Record<string, unknown>): Promise<any>;
+  close(): void;
+}
+
 export declare class Brow {
+  /** Instância de Session ou nome da sessão. Cada sessão é um Chrome separado. */
+  constructor(session?: Session | string);
+  readonly name: string;
+  readonly paths: Record<string, string>;
   call(cmd: string, params?: Record<string, unknown>): Promise<unknown>;
   info(): Promise<Info>;
   running(): Promise<boolean>;
@@ -108,11 +129,16 @@ export declare class Brow {
   screenshot(opts?: { path?: string; fullPage?: boolean }): Promise<{ path: string; bytes: number }>;
 
   disconnect(): void;
-  shutdown(): Promise<void>;
+  shutdown(opts?: { timeoutMs?: number }): Promise<void>;
 }
 
 export declare const brow: Brow;
-export declare function probe(): Promise<boolean>;
+/** Daemon da sessão está de pé? Não sobe um. Omitida = default. */
+export declare function probe(session?: string): Promise<boolean>;
+/** Sessões em disco desta pasta ("default" sempre primeiro). */
+export declare function sessions(): Promise<SessionInfo[]>;
+/** Derruba a sessão; false se já não estava rodando. */
+export declare function stopSession(session?: string, opts?: { timeoutMs?: number }): Promise<boolean>;
 export declare const paths: {
   STATE_DIR: string;
   SOCKET_PATH: string;

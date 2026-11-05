@@ -4,7 +4,7 @@ import { createConnection } from "node:net";
 import { closeSync, existsSync, openSync, statSync, unlinkSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
-import { LOCK_FILE, LOG_FILE, PKG_ROOT, SOCKET_PATH, STATE_DIR, ensureStateDir } from "./paths.js";
+import { LOG_FILE, PKG_ROOT, SOCKET_PATH, STATE_DIR, ensureStateDir, listSessions, sessionPaths } from "./paths.js";
 
 const DAEMON = join(PKG_ROOT, "src", "daemon.js");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -38,17 +38,17 @@ function connect(path, timeoutMs = 1000) {
   });
 }
 
-function spawnDaemon() {
-  ensureStateDir();
-  const fd = openSync(LOG_FILE, "a");
+function spawnDaemon(p) {
+  ensureStateDir(p.STATE_DIR);
+  const fd = openSync(p.LOG_FILE, "a");
   const child = spawn(process.execPath, [DAEMON], {
     detached: true,
     stdio: ["ignore", fd, fd],
     // BROW_HOME explícito: o daemon roda com cwd dentro de .brow/, então se ele
     // re-derivasse a pasta pelo cwd acabaria criando .brow/.brow. Quem decide
-    // qual é a pasta é o cliente, uma vez só.
-    env: { ...process.env, BROW_HOME: STATE_DIR },
-    cwd: STATE_DIR,
+    // qual é a pasta é o cliente, uma vez só — inclusive a da sessão.
+    env: { ...process.env, BROW_HOME: p.STATE_DIR, BROW_SESSION: "" },
+    cwd: p.STATE_DIR,
   });
   child.unref();
   closeSync(fd);
@@ -65,42 +65,42 @@ function spawnDaemon() {
 }
 
 /** Lock cru: quem cria o arquivo sobe o daemon; o resto só espera. */
-function acquireLock() {
+function acquireLock(p) {
   try {
-    if (existsSync(LOCK_FILE) && Date.now() - statSync(LOCK_FILE).mtimeMs > 60_000) unlinkSync(LOCK_FILE);
+    if (existsSync(p.LOCK_FILE) && Date.now() - statSync(p.LOCK_FILE).mtimeMs > 60_000) unlinkSync(p.LOCK_FILE);
   } catch {}
   try {
-    closeSync(openSync(LOCK_FILE, "wx"));
+    closeSync(openSync(p.LOCK_FILE, "wx"));
     return true;
   } catch (e) {
     if (e.code === "EEXIST") return false;
     throw e; // ENOENT/EACCES é bug de setup, não concorrência — não engolir
   }
 }
-const releaseLock = () => {
+const releaseLock = (p) => {
   try {
-    unlinkSync(LOCK_FILE);
+    unlinkSync(p.LOCK_FILE);
   } catch {}
 };
 
-async function ensureDaemon({ timeoutMs = 45_000 } = {}) {
-  ensureStateDir();
-  let sock = await connect(SOCKET_PATH, 500);
+async function ensureDaemon(p, { timeoutMs = 45_000 } = {}) {
+  ensureStateDir(p.STATE_DIR);
+  let sock = await connect(p.SOCKET_PATH, 500);
   if (sock) return sock;
 
   let died = null;
-  const mine = acquireLock();
+  const mine = acquireLock(p);
   if (mine) {
     try {
-      if (existsSync(SOCKET_PATH)) {
+      if (existsSync(p.SOCKET_PATH)) {
         // Socket fantasma (daemon morreu sem limpar): remove antes de subir.
         try {
-          unlinkSync(SOCKET_PATH);
+          unlinkSync(p.SOCKET_PATH);
         } catch {}
       }
-      died = spawnDaemon();
+      died = spawnDaemon(p);
     } catch (e) {
-      releaseLock();
+      releaseLock(p);
       throw e;
     }
   }
@@ -108,23 +108,29 @@ async function ensureDaemon({ timeoutMs = 45_000 } = {}) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     await sleep(120);
-    sock = await connect(SOCKET_PATH, 500);
+    sock = await connect(p.SOCKET_PATH, 500);
     if (sock) {
-      if (mine) releaseLock();
+      if (mine) releaseLock(p);
       return sock;
     }
     if (died?.code != null) {
-      releaseLock();
-      throw new Error(`daemon morreu no boot (code=${died.code}) — veja ${LOG_FILE}`);
+      releaseLock(p);
+      throw new Error(`daemon morreu no boot (code=${died.code}) — veja ${p.LOG_FILE}`);
     }
   }
-  if (mine) releaseLock();
-  throw new Error(`daemon não subiu em ${timeoutMs / 1000}s — veja ${LOG_FILE}`);
+  if (mine) releaseLock(p);
+  throw new Error(`daemon não subiu em ${timeoutMs / 1000}s — veja ${p.LOG_FILE}`);
 }
 
-/** Conexão persistente: um socket serve N comandos (usado pela lib e pelo MCP). */
+/**
+ * Conexão persistente: um socket serve N comandos (usado pela lib e pelo MCP).
+ * `name` escolhe a sessão — cada uma é um daemon/Chrome/perfil separado.
+ * Omitido = `$BROW_SESSION` ou "default" (a própria `.brow/`).
+ */
 export class Session {
-  constructor() {
+  constructor(name) {
+    this.paths = sessionPaths(name);
+    this.name = this.paths.session;
     this.sock = null;
     this.seq = 0;
     this.pending = new Map();
@@ -133,7 +139,7 @@ export class Session {
 
   async #ensure() {
     if (this.sock && !this.sock.destroyed) return this.sock;
-    const sock = await ensureDaemon();
+    const sock = await ensureDaemon(this.paths);
     sock.setNoDelay(true);
     sock.on("data", (chunk) => {
       this.buf += chunk.toString("utf8");
@@ -181,16 +187,42 @@ export class Session {
   }
 }
 
-/** Testa se o daemon da pasta está de pé SEM subir um. */
-export async function probe() {
-  const sock = await connect(SOCKET_PATH, 400);
+/** Testa se o daemon da sessão está de pé SEM subir um. */
+export async function probe(name) {
+  const sock = await connect(sessionPaths(name).SOCKET_PATH, 400);
   if (!sock) return false;
   sock.destroy();
   return true;
 }
 
-const shared = new Session();
-/** Chamada avulsa contra o daemon da pasta (sobe se preciso). */
-export const call = (cmd, params) => shared.call(cmd, params);
-export const closeShared = () => shared.close();
+/**
+ * Derruba o daemon da sessão e só volta quando o socket sumiu de verdade —
+ * senão o próximo comando reconecta num daemon que está morrendo.
+ * Devolve false se ela já não estava rodando.
+ */
+export async function stopSession(name, { timeoutMs = 10_000 } = {}) {
+  if (!(await probe(name))) return false;
+  const s = new Session(name);
+  await s.call("shutdown").catch(() => {});
+  s.close();
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!(await probe(name))) return true;
+    await sleep(100);
+  }
+  throw new Error(`sessão ${s.name}: daemon não desligou no tempo esperado`);
+}
+
+/** Sessões em disco desta pasta, com quem está de pé agora. */
+export async function sessions() {
+  return Promise.all(
+    listSessions().map(async (name) => ({ name, running: await probe(name), dir: sessionPaths(name).STATE_DIR }))
+  );
+}
+
+// Preguiçoso: um $BROW_SESSION inválido vira erro na chamada, não no import.
+let shared = null;
+/** Chamada avulsa contra o daemon da sessão default (sobe se preciso). */
+export const call = (cmd, params) => (shared ??= new Session()).call(cmd, params);
+export const closeShared = () => shared?.close();
 export { SOCKET_PATH, LOG_FILE, STATE_DIR };

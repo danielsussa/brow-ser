@@ -16,6 +16,7 @@ import { DOWNLOADS_DIR, SHOTS_DIR } from "./paths.js";
 import {
   BOOTSTRAP,
   SNAPSHOT,
+  TRACKER_WORLD,
   boxJs,
   clickJs,
   findByLabelJs,
@@ -51,7 +52,14 @@ const KEYS = {
 const SETTLE_TIMEOUT = Number(process.env.BROW_SETTLE_TIMEOUT ?? 8000);
 const QUIET_MS = Number(process.env.BROW_QUIET_MS ?? 250);
 const DOM_GRACE_MS = Number(process.env.BROW_DOM_GRACE_MS ?? 600);
+// Depois do último fetch/XHR, o render costuma vir num setTimeout curto. Sem
+// poder instrumentar timers da página (seria detectável), a rede só conta como
+// quieta depois desse eco.
+const NET_ECHO_MS = Number(process.env.BROW_NET_ECHO_MS ?? 500);
 const LOAD_TIMEOUT = Number(process.env.BROW_LOAD_TIMEOUT ?? 15000);
+
+const TRACKER_READ = "window.__brow ? window.__brow.lastMutation : null";
+const isApi = (r) => r.type === "XHR" || r.type === "Fetch";
 
 const DESTROYED = /Execution context was destroyed|Cannot find context|Inspected target navigated|Session with given id not found/i;
 
@@ -75,6 +83,12 @@ export class Browser {
     this.finished = [];
     this.inflight = new Map();
     this.netWaiters = new Set();
+    /** fim do último fetch/XHR (base do eco de rede no settled) */
+    this.lastApiEnd = 0;
+    /** executionContextId do mundo isolado no frame principal (cache) */
+    this.trackerCtx = null;
+    /** commit do documento atual: request de antes disso é do doc anterior */
+    this.docStart = 0;
   }
 
   static async launch(opts = {}) {
@@ -104,8 +118,8 @@ export class Browser {
 
     await this.send("Page.enable");
     await this.send("Network.enable", { maxTotalBufferSize: 1_000_000, maxResourceBufferSize: 500_000 });
-    await this.send("Page.addScriptToEvaluateOnNewDocument", { source: BOOTSTRAP });
-    await this.eval(BOOTSTRAP).catch(() => {});
+    await this.send("Page.addScriptToEvaluateOnNewDocument", { source: BOOTSTRAP, worldName: TRACKER_WORLD });
+    await this.#evalTracker(BOOTSTRAP).catch(() => {});
 
     await this.cdp
       .send("Browser.setDownloadBehavior", { behavior: "allow", downloadPath: DOWNLOADS_DIR })
@@ -123,10 +137,16 @@ export class Browser {
       this.send("Page.handleJavaScriptDialog", { accept: true }).catch(() => {});
       return;
     }
+    if (method === "Page.frameNavigated" && !params.frame.parentId) {
+      this.trackerCtx = null;
+      this.docStart = Date.now();
+      return;
+    }
     if (method === "Network.requestWillBeSent") {
       this.inflight.set(params.requestId, {
         url: params.request.url,
         method: params.request.method,
+        type: params.type,
         start: Date.now(),
         status: null,
       });
@@ -137,6 +157,7 @@ export class Browser {
       const r = this.inflight.get(params.requestId);
       if (!r) return;
       this.inflight.delete(params.requestId);
+      if (isApi(r)) this.lastApiEnd = Date.now();
       const rec = {
         url: r.url,
         method: r.method,
@@ -204,6 +225,45 @@ export class Browser {
     }
   }
 
+  /**
+   * Runtime.evaluate no mundo isolado do tracker. O contexto vem de
+   * Page.createIsolatedWorld com o mesmo worldName do
+   * addScriptToEvaluateOnNewDocument — o Chrome reusa o mundo pelo nome, então
+   * o `window.__brow` de lá é o que o BOOTSTRAP instalou. Sem Runtime.enable.
+   */
+  async #evalTracker(expression) {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        if (!this.trackerCtx) {
+          const { frameTree } = await this.send("Page.getFrameTree");
+          const { executionContextId } = await this.send("Page.createIsolatedWorld", {
+            frameId: frameTree.frame.id,
+            worldName: TRACKER_WORLD,
+          });
+          this.trackerCtx = executionContextId;
+        }
+        const r = await this.send("Runtime.evaluate", {
+          expression,
+          contextId: this.trackerCtx,
+          returnByValue: true,
+        });
+        if (r.exceptionDetails) throw new Error(r.exceptionDetails.text || "js exception");
+        return r.result?.value;
+      } catch (e) {
+        this.trackerCtx = null;
+        if (attempt > 0 || !DESTROYED.test(String(e.message))) throw e;
+        await sleep(150);
+      }
+    }
+  }
+
+  /** fetch/XHR em voo (o que o site espera antes de renderizar) */
+  apiInFlight() {
+    let n = 0;
+    for (const r of this.inflight.values()) if (isApi(r) && r.start >= this.docStart) n++;
+    return n;
+  }
+
   /** Entrega arquivos locais a um <input type=file> (o 1º que casa com `selector`), como o seletor do sistema. */
   async upload(selector, files) {
     const r = await this.send("Runtime.evaluate", {
@@ -218,10 +278,10 @@ export class Browser {
   // --- contrato "página pronta" -------------------------------------------
 
   /**
-   * Settled = fontes carregadas + zero fetch/XHR em voo (e nenhum timer curto
-   * agendado na esteira de um request) por `quietMs` + zero mutação de DOM por
-   * `quietMs`. Heurística declarada: devolve o motivo da saída em vez de
-   * fingir certeza.
+   * Settled = fontes carregadas + zero fetch/XHR em voo por `quietMs` (e
+   * `NET_ECHO_MS` desde o último terminar, pro render que vem num timer curto)
+   * + zero mutação de DOM por `quietMs`. Heurística declarada: devolve o motivo
+   * da saída em vez de fingir certeza.
    */
   async settled({ timeout = SETTLE_TIMEOUT, quietMs = QUIET_MS, domGraceMs = DOM_GRACE_MS } = {}) {
     const start = Date.now();
@@ -232,16 +292,18 @@ export class Browser {
     let quietSince = null;
     let reason = "timeout";
     while (Date.now() - start < timeout) {
-      const stat = await this.eval(
-        `(()=>{const t=window.__brow;return t?[t.inFlight,t.lastMutation,t.pendingTimers]:null;})()`
-      ).catch(() => null);
-      if (!stat) {
+      let lastMut = await this.#evalTracker(TRACKER_READ).catch(() => null);
+      if (lastMut == null) {
+        // documento que nasceu antes do attach (ou mundo recriado): instala agora
+        await this.#evalTracker(BOOTSTRAP).catch(() => {});
+        lastMut = await this.#evalTracker(TRACKER_READ).catch(() => null);
+      }
+      if (lastMut == null) {
         reason = "no-tracker";
         break;
       }
-      const [inFlight, lastMut, pendingTimers] = stat;
       const now = Date.now();
-      const busy = inFlight > 0 || pendingTimers > 0;
+      const busy = this.apiInFlight() > 0 || now - this.lastApiEnd < NET_ECHO_MS;
       quietSince = busy ? null : (quietSince ?? now);
       const netQuiet = quietSince !== null && now - quietSince >= quietMs;
       const domQuiet = now - lastMut >= quietMs;
@@ -320,7 +382,7 @@ export class Browser {
     return {
       url: await this.url(),
       title: await this.title(),
-      inFlight: (await this.eval("window.__brow ? window.__brow.inFlight : null").catch(() => null)) ?? null,
+      inFlight: this.apiInFlight(),
     };
   }
 

@@ -1,78 +1,25 @@
 // JS injetado na página. Isto é o coração "AI-friendly" do handoff, portado pra
 // rodar sob CDP puro: nada aqui depende de Playwright/Electron.
 //
-//  - BOOTSTRAP: __brow.inFlight (fetch+XHR em voo) + __brow.lastMutation
-//    (MutationObserver) = base do contrato "página pronta". Mais o guard de
-//    single-tab (window.open / target=_blank viram navegação na MESMA aba).
+//  - BOOTSTRAP: __brow.lastMutation (MutationObserver), num mundo isolado =
+//    metade DOM do contrato "página pronta" (a metade rede vem do daemon).
+//    Mais o guard de single-tab pra target=_blank.
 //  - SNAPSHOT: elementos interativos com `id` sequencial + `sid` determinístico
 //    (FNV-1a de role|label|ancestor-chain|sibling-index) que sobrevive a
 //    re-render de SPA.
 //  - probeJs/clickJs/typeJs/...: resolução de ref e ações de fallback.
 
+// Roda num MUNDO ISOLADO (worldName TRACKER_WORLD), não no mundo da página:
+// nada aqui pode alterar globais do site. Wrapper de fetch/XHR/setTimeout e
+// window.open sobrescrito são detectáveis (o anti-bot do YouTube corta o vídeo
+// em ~40s quando vê fetch não-nativo). Requests em voo vêm dos eventos Network
+// no daemon; aqui fica só o que se vê pelo DOM (compartilhado entre mundos).
+export const TRACKER_WORLD = "__brow";
+
 export const BOOTSTRAP = /* js */ `
 (() => {
   if (window.__brow) return;
-  let inFlight = 0;
-  let pendingTimers = 0;
   let lastMutation = Date.now();
-  let lastNetEnd = 0;
-  const markNetEnd = () => { lastNetEnd = Date.now(); };
-
-  const origFetch = window.fetch ? window.fetch.bind(window) : null;
-  if (origFetch) {
-    window.fetch = function (input, init) {
-      if (init && init.keepalive) return origFetch(input, init);
-      inFlight++;
-      const done = () => { inFlight--; markNetEnd(); };
-      return origFetch(input, init).then(
-        (r) => { done(); return r; },
-        (e) => { done(); throw e; }
-      );
-    };
-  }
-
-  const XHR = XMLHttpRequest.prototype;
-  const origSend = XHR.send;
-  XHR.send = function (...args) {
-    if (!this.__browCounted) {
-      this.__browCounted = true;
-      inFlight++;
-      this.addEventListener('loadend', () => { inFlight--; markNetEnd(); }, { once: true });
-    }
-    return origSend.apply(this, args);
-  };
-
-  // Timer pendente logo depois de um request: o padrao "fetch termina, e o
-  // render local vem num setTimeout curto". Rede e DOM ficam os dois quietos
-  // nesse buraco, e um settled ingenuo devolve cedo (limitacao conhecida do
-  // handoff). Contamos SO os timers agendados enquanto tem request em voo ou
-  // logo apos um terminar -- ticker de pagina ociosa nao entra, entao nao
-  // custa latencia nenhuma no caso comum.
-  const TIMER_MAX_DELAY = 1500;
-  const NET_ECHO_MS = 500;
-  const tracked = new Map();
-  const origSetTimeout = window.setTimeout;
-  const origClearTimeout = window.clearTimeout;
-  window.setTimeout = function (fn, delay) {
-    const rest = Array.prototype.slice.call(arguments, 2);
-    const d = Number(delay) || 0;
-    const relevant = typeof fn === 'function' && d <= TIMER_MAX_DELAY &&
-      (inFlight > 0 || Date.now() - lastNetEnd < NET_ECHO_MS);
-    if (!relevant) return origSetTimeout.apply(window, arguments);
-    pendingTimers++;
-    let id;
-    const wrapped = function () {
-      if (tracked.delete(id)) pendingTimers--;
-      return fn.apply(this, arguments);
-    };
-    id = origSetTimeout.apply(window, [wrapped, d].concat(rest));
-    tracked.set(id, true);
-    return id;
-  };
-  window.clearTimeout = function (id) {
-    if (tracked.delete(id)) pendingTimers--;
-    return origClearTimeout.apply(window, arguments);
-  };
 
   const startObserver = () => {
     if (!document.documentElement) { setTimeout(startObserver, 10); return; }
@@ -86,14 +33,10 @@ export const BOOTSTRAP = /* js */ `
   startObserver();
 
   // --- single tab -----------------------------------------------------------
-  // Aba nova é estado que o agente não pediu e não consegue endereçar. Popup e
-  // target=_blank passam a navegar aqui mesmo. O daemon ainda tem um watchdog
-  // no Target.targetCreated pro que escapar daqui (ex: window.open no onload).
+  // target=_blank vira navegação aqui mesmo (o DOM é compartilhado, então dá
+  // pra fazer do mundo isolado). window.open não dá sem tocar no global do
+  // site: fica com o watchdog de Target.targetCreated no daemon.
   try {
-    window.open = function (url) {
-      if (url) { try { location.href = String(url); } catch (e) {} }
-      return window;
-    };
     document.addEventListener('click', (e) => {
       const t = e.target;
       const a = t && t.closest ? t.closest('a[target]') : null;
@@ -102,8 +45,6 @@ export const BOOTSTRAP = /* js */ `
   } catch (e) { /* ignore */ }
 
   window.__brow = {
-    get inFlight() { return inFlight; },
-    get pendingTimers() { return pendingTimers; },
     get lastMutation() { return lastMutation; },
   };
 })();
